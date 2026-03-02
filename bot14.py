@@ -34,8 +34,11 @@ class Player(BaseBot):
         self.round_num = game_info.round_num
 
     def on_hand_end(self, game_info, current_state):
-        # The only reliable place to catch a fold
-        if current_state.payoff > 0 and not current_state.opp_revealed_cards:
+        # Detect opponent fold: we won but not at showdown.
+        # At showdown both hole cards are revealed (len == 2).
+        # If we won the auction we may have 1 card; the opponent can still fold later,
+        # so check len < 2 rather than the truthiness of the list.
+        if current_state.payoff > 0 and len(current_state.opp_revealed_cards) < 2:
             self.opp_folds += 1
         
         # Reset tracking variables for the next hand
@@ -67,12 +70,28 @@ class Player(BaseBot):
         wins = 0
         needed = 5 - len(board_cards)
 
-        for _ in range(samples):
-            sample = random.sample(remaining, len(remaining))
+        # Determine how many cards to draw each iteration:
+        # 0 unknown opp cards + board fill  → fully known opp hand (2 cards)
+        # 1 unknown opp card  + board fill  → partially revealed opp hand (auction win)
+        # 2 unknown opp cards + board fill  → unknown opp hand
+        if p2_known and len(p2_known) == 2:
+            n_draw = needed
+        elif p2_known and len(p2_known) == 1:
+            n_draw = 1 + needed          # 1 unknown opp card + board cards
+        else:
+            n_draw = 2 + needed          # 2 unknown opp cards + board cards
 
-            if p2_known:
+        for _ in range(samples):
+            # Only sample the cards we actually need (more efficient than a full shuffle)
+            sample = random.sample(remaining, n_draw)
+
+            if p2_known and len(p2_known) == 2:
                 opp = p2_known
                 sim_board = board_cards + sample[:needed]
+            elif p2_known and len(p2_known) == 1:
+                # One opponent card known (auction), one drawn from remaining
+                opp = p2_known + [sample[0]]
+                sim_board = board_cards + sample[1:1 + needed]
             else:
                 opp = sample[:2]
                 sim_board = board_cards + sample[2:2 + needed]
@@ -93,41 +112,31 @@ class Player(BaseBot):
     # AUCTION EXPLOIT STRATEGY
     # -------------------------------------------------
 
-    def auction_strategy(self, my_hand, chips):
+    def auction_strategy(self, my_hand, board, chips, pot):
+        """Bid the true value of information — optimal for a second-price (Vickrey) auction.
 
-        ranks = [c[0] for c in my_hand]
-        suits = [c[1] for c in my_hand]
+        The true value equals the expected EV gain (in chips) from knowing one opponent card.
+        We approximate it as:  info_gain_equity * pot
+        where info_gain_equity is higher when our hand is in a "swing range" (equity ≈ 0.5).
+        At extreme equities (near 0 or 1) one extra card changes little, so we bid less.
+        """
+        # Post-flop equity (board has 3 cards at auction time)
+        eq = self.monte_carlo_equity(my_hand, board, samples=40)
 
-        is_pair = ranks[0] == ranks[1]
-        suited = suits[0] == suits[1]
+        # Information value peaks when equity is near 50% (maximum decision uncertainty)
+        # and falls to near 0 when we are a heavy favourite or heavy underdog.
+        info_sensitivity = 1.0 - abs(eq - 0.5) * 2.0   # range [0, 1]
 
-        # Premium pairs slowplay (they play well anyway)
-        if is_pair and ranks[0] in "AK":
-            base = 0.03
+        # True value in chips: willing to pay up to ~20% of pot for perfect information,
+        # scaled by how much one card actually helps.
+        true_value = int(pot * 0.20 * info_sensitivity)
 
-        # Information-sensitive hands
-        elif suited or is_pair:
-            base = 0.12
+        # Hard cap: never bid more than 1.5× the pot (information cannot be worth more).
+        pot_cap = int(pot * 1.5)
+        true_value = min(true_value, pot_cap, chips)
 
-        # Broadway
-        elif all(r in "AKQJT" for r in ranks):
-            base = 0.10
-
-        # Single high card
-        elif any(r in "AKQJT" for r in ranks):
-            base = 0.01
-
-        else:
-            base = 0.00
-
-        # Calculate bid WITH jitter first
-        jitter = random.randint(-3, 3)
-        bid = int(chips * base) + jitter
-        
-        # Apply the Pot Cap to the final bid
-        # This prevents bidding 500 to win a 40 chip pot
-        
-        return max(0, bid)
+        jitter = random.randint(-2, 2)
+        return max(0, true_value + jitter)
     # -------------------------------------------------
     # MAIN DECISION LOGIC
     # -------------------------------------------------
@@ -137,9 +146,12 @@ class Player(BaseBot):
 
         # ---------- AUCTION ----------
         if street == "auction":
-            bid = self.auction_strategy(current_state.my_hand, current_state.my_chips)
-            pot_cap = int(current_state.pot * 1.5) 
-            bid = min(bid, pot_cap)
+            bid = self.auction_strategy(
+                current_state.my_hand,
+                current_state.board,
+                current_state.my_chips,
+                current_state.pot,
+            )
             return ActionBid(bid)
 
         # ---------- TRACKING & STATE MANAGEMENT ----------
@@ -160,7 +172,7 @@ class Player(BaseBot):
 
         # ---------- EQUITY CALCULATIONS ----------
         opp_hand = current_state.opp_revealed_cards
-        win_prob = self.monte_carlo_equity(current_state.my_hand, current_state.board, opp_hand, samples=100)
+        win_prob = self.monte_carlo_equity(current_state.my_hand, current_state.board, opp_hand, samples=60)
 
         if current_state.cost_to_call > 0:
             win_prob -= 0.12 
